@@ -1,0 +1,6 @@
+{
+  "name": "HTML to Figma Converter",
+  "description": "Convert live website URLs, HTML templates, and CSS into editable Figma .fig files, clipboard paste payloads with Auto Layout, and Figma JSON.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
