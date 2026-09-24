@@ -1,10 +1,10 @@
-// Local server: serves the same API as production (server/app.ts) plus the
+// Local server: serves the same API as production (api/_app.ts) plus the
 // frontend — through Vite middleware in dev, or the built dist/ in production.
 // On Vercel this file is not used at all; api/[...path].ts is the entrypoint.
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import app from './server/app';
+import app from './api/_app.js';
 
 const PORT = Number(process.env.PORT || 3000);
 
