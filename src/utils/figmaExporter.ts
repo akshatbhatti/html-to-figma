@@ -46,13 +46,31 @@ function createRobustImageLoader() {
 }
 
 /**
+ * Realm-safe element test.
+ *
+ * `x instanceof HTMLElement` compares against THIS window's HTMLElement. Everything
+ * we convert lives inside a preview/stage iframe, which is a separate realm with its
+ * own constructors, so that check is false for every single element we are given.
+ * It silently disabled the classifier and both token extractors. Duck-type instead.
+ */
+function isElementNode(node: unknown): node is HTMLElement {
+  return !!node && (node as Node).nodeType === 1 && typeof (node as HTMLElement).tagName === 'string';
+}
+
+/** Computed style resolved through the element's OWN window, not necessarily ours. */
+function computedStyleOf(el: Element): CSSStyleDeclaration {
+  const view = el.ownerDocument?.defaultView || window;
+  return view.getComputedStyle(el);
+}
+
+/**
  * Intelligent element classifier:
  * Filters out offscreen navigation drawers, hidden modals, visually-hidden screenreader junk,
  * and zero-opacity backdrops that cause weird overlapping artifacts at the top of Figma.
  */
 function createSmartClassify() {
   return (element: Element, defaultKind: any) => {
-    if (!(element instanceof HTMLElement)) {
+    if (!isElementNode(element)) {
       return defaultKind;
     }
 
@@ -62,7 +80,7 @@ function createSmartClassify() {
     }
 
     try {
-      const style = window.getComputedStyle(element);
+      const style = computedStyleOf(element);
 
       // 1. Explicitly hidden elements
       if (style.display === 'none') return 'skip';
@@ -103,8 +121,21 @@ function createSmartClassify() {
         return 'skip';
       }
 
-      // 6. Zero-sized clipped containers
-      if (rect.width === 0 && rect.height === 0 && style.overflow === 'hidden') {
+      // 6. Collapsed clipped containers — closed dropdowns, accordions and mega
+      // menus are full-width but height:0 with overflow:hidden. Requiring BOTH
+      // dimensions to be zero missed all of them, so their contents were exported
+      // as a stray list of links over the top of the design.
+      if (style.overflow === 'hidden' && (rect.height === 0 || rect.width === 0)) {
+        return 'skip';
+      }
+
+      // 7. Collapsed by max-height/max-width (the other common accordion pattern),
+      // where the box still reports a size but clips everything inside it.
+      if (
+        (style.maxHeight === '0px' || style.maxWidth === '0px') &&
+        style.overflow !== 'visible' &&
+        element.children.length > 0
+      ) {
         return 'skip';
       }
     } catch {
@@ -112,6 +143,132 @@ function createSmartClassify() {
     }
 
     return defaultKind;
+  };
+}
+
+/**
+ * Prepares a rendered page for capture the way a real visitor would: by scrolling it.
+ *
+ * Two things never happen if you convert a freshly loaded page. Lazy images only
+ * start downloading as they approach the viewport, and scroll-reveal animations
+ * hold their elements at opacity:0 until an IntersectionObserver fires. Converting
+ * immediately therefore captures blank gaps where whole sections belong. Walking
+ * the page top to bottom lets the site's own code do the revealing, then we return
+ * to the top so every rect is measured from the true origin.
+ */
+async function primeStageForCapture(root: HTMLElement, timeoutMs = 15000): Promise<() => void> {
+  const doc = root.ownerDocument;
+  const win = doc?.defaultView;
+  if (!doc || !win) return () => {};
+
+  // Inline styles we force on for the capture, with their previous values so the
+  // live preview the user is looking at is handed back exactly as we found it.
+  const forced: Array<{ el: HTMLElement; opacity: string; transform: string }> = [];
+
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => Math.max(0, deadline - Date.now());
+
+  // Collapse reveal transitions to zero so they finish the instant they trigger
+  // instead of over several hundred milliseconds we would have to wait out.
+  const style = doc.createElement('style');
+  style.setAttribute('data-figma-capture', 'true');
+  style.textContent =
+    '*,*::before,*::after{transition-duration:0s !important;transition-delay:0s !important;' +
+    'animation-delay:0s !important;scroll-behavior:auto !important;}';
+  doc.head?.appendChild(style);
+
+  try {
+    const viewportHeight = win.innerHeight || 800;
+    const pageHeight = Math.max(doc.documentElement?.scrollHeight || 0, doc.body?.scrollHeight || 0);
+    const step = Math.max(200, Math.floor(viewportHeight * 0.8));
+
+    for (let y = 0; y < pageHeight && remaining() > 0; y += step) {
+      win.scrollTo(0, y);
+      await delay(60);
+    }
+
+    win.scrollTo(0, pageHeight);
+    await delay(150);
+    win.scrollTo(0, 0);
+    await delay(150);
+
+    // Whatever the scroll just kicked off still has to finish downloading.
+    const images = Array.from(doc.images || []);
+    await Promise.all(
+      images.map(
+        (img) =>
+          new Promise<void>((resolve) => {
+            // `complete` is also true for images that already failed; those will
+            // never fire another event, so waiting on them just burns the budget.
+            if (img.complete) return resolve();
+            const done = () => resolve();
+            img.addEventListener('load', done, { once: true });
+            img.addEventListener('error', done, { once: true });
+            setTimeout(done, Math.min(4000, remaining()));
+          })
+      )
+    );
+
+    // Bounded separately: fonts.ready can stay pending indefinitely on a page with
+    // a font that never resolves, and racing it against the whole remaining budget
+    // meant one stubborn webfont cost the entire capture its time.
+    try {
+      await Promise.race([
+        (doc as any).fonts?.ready ?? Promise.resolve(),
+        delay(Math.min(3000, remaining())),
+      ]);
+    } catch {
+      // ignore
+    }
+
+    // Anything still fully transparent after a complete scroll never got revealed
+    // — typically a scroll animation whose IntersectionObserver does not fire for
+    // an offscreen stage. Force the end state, but only where there is real content
+    // to show: genuinely hidden things (dialogs, menus, collapsed boxes) stay hidden.
+    for (const node of Array.from(root.querySelectorAll('*'))) {
+      if (!isElementNode(node)) continue;
+
+      const style2 = computedStyleOf(node);
+      if (parseFloat(style2.opacity || '1') !== 0) continue;
+      if (style2.display === 'none' || style2.visibility === 'hidden') continue;
+      if (node.getAttribute('aria-hidden') === 'true') continue;
+
+      const role = node.getAttribute('role');
+      if (role === 'dialog' || role === 'menu' || role === 'tooltip') continue;
+
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+
+      const hasContent = node.querySelector('img, svg, picture, video') || (node.textContent || '').trim().length > 0;
+      if (!hasContent) continue;
+
+      forced.push({ el: node, opacity: node.style.opacity, transform: node.style.transform });
+      node.style.setProperty('opacity', '1', 'important');
+      // Reveal animations usually pair the fade with an offset that must go too.
+      if (style2.transform && style2.transform !== 'none') {
+        node.style.setProperty('transform', 'none', 'important');
+      }
+    }
+
+    await new Promise<void>((resolve) => {
+      try {
+        win.requestAnimationFrame(() => win.requestAnimationFrame(() => resolve()));
+      } catch {
+        resolve();
+      }
+    });
+  } finally {
+    style.remove();
+  }
+
+  return () => {
+    for (const { el, opacity, transform } of forced) {
+      if (opacity) el.style.setProperty('opacity', opacity);
+      else el.style.removeProperty('opacity');
+      if (transform) el.style.setProperty('transform', transform);
+      else el.style.removeProperty('transform');
+    }
+    forced.length = 0;
   };
 }
 
@@ -131,7 +288,7 @@ function prepareFormElementsForConversion(root: HTMLElement): () => void {
     );
 
     for (const el of formControls) {
-      const style = window.getComputedStyle(el);
+      const style = computedStyleOf(el);
       if (style.display === 'none' || style.visibility === 'hidden') continue;
 
       const tagName = el.tagName.toLowerCase();
@@ -415,9 +572,9 @@ export function extractColorsFromElement(root: HTMLElement): ExtractedColor[] {
   const elements = [root, ...Array.from(root.querySelectorAll('*'))] as HTMLElement[];
 
   for (const el of elements) {
-    if (!(el instanceof HTMLElement)) continue;
+    if (!isElementNode(el)) continue;
     try {
-      const style = window.getComputedStyle(el);
+      const style = computedStyleOf(el);
       const bgHex = rgbToHex(style.backgroundColor);
       if (bgHex) {
         const existing = colorMap.get(bgHex) || { count: 0, type: 'background', rgba: style.backgroundColor };
@@ -460,9 +617,9 @@ export function extractTypographyFromElement(root: HTMLElement): ExtractedFont[]
   const elements = [root, ...Array.from(root.querySelectorAll('*'))] as HTMLElement[];
 
   for (const el of elements) {
-    if (!(el instanceof HTMLElement) || !el.textContent?.trim()) continue;
+    if (!isElementNode(el) || !el.textContent?.trim()) continue;
     try {
-      const style = window.getComputedStyle(el);
+      const style = computedStyleOf(el);
       const family = style.fontFamily.split(',')[0].replace(/['"]/g, '').trim();
       const weight = parseInt(style.fontWeight, 10) || 400;
       const size = style.fontSize;
@@ -707,12 +864,15 @@ export async function convertDomToFigma(
   } = {}
 ): Promise<ConversionResult> {
   const startTime = performance.now();
-  const {
-    name = 'Exported Page',
-    autoLayout = true,
-    width = element.scrollWidth || element.offsetWidth || 1200,
-    height = element.scrollHeight || element.offsetHeight || 800,
-  } = options;
+  const { name = 'Exported Page', autoLayout = true } = options;
+
+  // Reveal lazy images and scroll-triggered sections BEFORE measuring anything:
+  // doing so usually makes the page taller, and a height measured beforehand would
+  // crop the sections that just appeared.
+  const restorePrime = await primeStageForCapture(element);
+
+  const width = options.width ?? (element.scrollWidth || element.offsetWidth || 1200);
+  const height = options.height ?? (element.scrollHeight || element.offsetHeight || 800);
 
   // 1. Extract Design Tokens & Assets
   const colors = extractColorsFromElement(element);
@@ -744,6 +904,7 @@ export async function convertDomToFigma(
   } finally {
     // Immediately restore original DOM in the iframe
     restoreForms();
+    restorePrime();
   }
 
   const { document } = convertResult;
@@ -1008,6 +1169,10 @@ async function createResponsiveStage(
 
     const body = doc.body as HTMLElement;
     if (!body) throw new Error('Offscreen rendering stage produced an empty document');
+
+    // Scroll this breakpoint through its own lazy content before measuring height.
+    // No restore needed: the stage iframe is disposed right after the conversion.
+    await primeStageForCapture(body);
 
     const height = Math.max(
       doc.documentElement?.scrollHeight || 0,
