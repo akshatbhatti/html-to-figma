@@ -15,6 +15,7 @@ import {
   Bookmark,
   Layers2,
   ChevronDown,
+  LogOut,
 } from 'lucide-react';
 import { InputMode, ViewportMode } from '../types';
 
@@ -31,6 +32,7 @@ interface HeaderProps {
   onCopyResponsiveClipboard: () => void;
   onOpenGuide: () => void;
   onOpenBookmarklet: () => void;
+  onLogout: () => void;
   isConverting: boolean;
   copied: boolean;
   copiedResponsive: boolean;
@@ -50,6 +52,7 @@ export const Header: React.FC<HeaderProps> = ({
   onCopyResponsiveClipboard,
   onOpenGuide,
   onOpenBookmarklet,
+  onLogout,
   isConverting,
   copied,
   copiedResponsive,
@@ -195,6 +198,15 @@ export const Header: React.FC<HeaderProps> = ({
           className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs transition"
         >
           <HelpCircle className="w-3.5 h-3.5" />
+        </button>
+
+        <button
+          onClick={onLogout}
+          title="Log out"
+          className="flex items-center gap-1.5 rounded-xl border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-200 transition hover:bg-red-500/20"
+        >
+          <LogOut className="h-3.5 w-3.5" />
+          <span className="hidden sm:inline">Logout</span>
         </button>
 
         <div className="h-5 w-[1px] bg-slate-800 mx-0.5"></div>

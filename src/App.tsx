@@ -9,6 +9,7 @@ import { FigmaGuideModal } from './components/FigmaGuideModal';
 import { BookmarkletModal } from './components/BookmarkletModal';
 import { ToastContainer, ToastMessage } from './components/Toast';
 import { HTML_TEMPLATES } from './data/templates';
+
 import {
   InputMode,
   ViewportMode,
@@ -35,6 +36,11 @@ const VIEWPORT_CONFIGS: Record<ViewportMode, ViewportDimensions> = {
 };
 
 export function App() {
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [username, setUsername] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
+  const [loginError, setLoginError] = useState<string>('');
+  const [authReady, setAuthReady] = useState<boolean>(false);
   const [mode, setMode] = useState<InputMode>('code');
   const [viewport, setViewport] = useState<ViewportMode>('laptop');
   const [autoLayout, setAutoLayout] = useState<boolean>(true);
@@ -126,6 +132,25 @@ export function App() {
       setIsFetchingUrl(false);
     }
   };
+
+  useEffect(() => {
+    const checkSession = async () => {
+      try {
+        const res = await fetch('/api/session', { credentials: 'same-origin' });
+        const data = await res.json();
+        if (res.ok && data.authenticated) {
+          setIsLoggedIn(true);
+          setUsername(data.username || 'admin');
+        }
+      } catch {
+        setIsLoggedIn(false);
+      } finally {
+        setAuthReady(true);
+      }
+    };
+
+    void checkSession();
+  }, []);
 
   // Check URL query parameters for 1-click Bookmarklet integration
   useEffect(() => {
@@ -381,6 +406,114 @@ export function App() {
     iframeRef.current = iframe;
   }, []);
 
+  const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    const trimmedUsername = username.trim();
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username: trimmedUsername, password }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLoginError(data.error || 'Invalid username or password');
+        return;
+      }
+
+      setIsLoggedIn(true);
+      setUsername(data.username || trimmedUsername);
+      setLoginError('');
+      setPassword('');
+    } catch {
+      setLoginError('Unable to reach the authentication server');
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch {
+      // ignore logout failures and still clear local UI state
+    }
+
+    setIsLoggedIn(false);
+    setUsername('');
+    setPassword('');
+    setLoginError('');
+  };
+
+  if (!authReady) {
+    return null;
+  }
+
+  if (!isLoggedIn) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4 text-slate-100">
+        <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/90 p-8 shadow-2xl shadow-slate-950/50 backdrop-blur-sm">
+          <div className="mb-8 text-center">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-cyan-500/20 text-xl font-bold text-cyan-300">
+              F
+            </div>
+            <h1 className="text-2xl font-bold text-white">Sign in</h1>
+            <p className="mt-2 text-sm text-slate-400">HTML to Figma converter</p>
+          </div>
+
+          <form className="space-y-5" onSubmit={handleLogin}>
+            <div>
+              <label htmlFor="username" className="mb-2 block text-sm font-medium text-slate-300">
+                Username
+              </label>
+              <input
+                id="username"
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white outline-none ring-0 transition focus:border-cyan-500"
+                placeholder="Enter username"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="password" className="mb-2 block text-sm font-medium text-slate-300">
+                Password
+              </label>
+              <input
+                id="password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white outline-none ring-0 transition focus:border-cyan-500"
+                placeholder="Enter password"
+              />
+            </div>
+
+            {loginError && (
+              <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                {loginError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="w-full rounded-xl bg-cyan-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
+            >
+              Login
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 overflow-hidden font-sans">
       {/* Top Header */}
@@ -397,6 +530,7 @@ export function App() {
         onCopyResponsiveClipboard={handleCopyResponsiveClipboard}
         onOpenGuide={() => setShowGuide(true)}
         onOpenBookmarklet={() => setShowBookmarklet(true)}
+        onLogout={handleLogout}
         isConverting={isConverting}
         copied={copied}
         copiedResponsive={copiedResponsive}

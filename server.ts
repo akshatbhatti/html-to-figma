@@ -1,20 +1,125 @@
 import express from 'express';
 import path from 'path';
 import cors from 'cors';
+import crypto from 'crypto';
 import * as cheerio from 'cheerio';
 import JSZip from 'jszip';
 import { createServer as createViteServer } from 'vite';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+const AUTH_COOKIE_NAME = 'html_to_figma_session';
+const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 8;
+const APP_CREDENTIALS = {
+  username: process.env.APP_USERNAME || 'admin',
+  password: process.env.APP_PASSWORD || 'fdsft5t54rferfg6655vdfvgrty565433vcvvc',
+};
+const authSessions = new Map<string, { username: string; expiresAt: number }>();
+
+const parseCookies = (cookieHeader?: string): Record<string, string> => {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) return cookies;
+
+  cookieHeader.split(';').forEach((segment) => {
+    const [name, ...rest] = segment.trim().split('=');
+    if (name && rest.length > 0) {
+      cookies[name] = decodeURIComponent(rest.join('='));
+    }
+  });
+
+  return cookies;
+};
+
+const createSessionToken = () => crypto.randomBytes(32).toString('hex');
+
+const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE_NAME];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const session = authSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    authSessions.delete(token);
+    res.clearCookie(AUTH_COOKIE_NAME, { httpOnly: true, sameSite: 'lax' });
+    return res.status(401).json({ error: 'Session expired or invalid' });
+  }
+
+  next();
+};
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Health Check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/session', (req, res) => {
+  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE_NAME];
+  if (!token) {
+    return res.json({ authenticated: false });
+  }
+
+  const session = authSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    authSessions.delete(token);
+    res.clearCookie(AUTH_COOKIE_NAME, { httpOnly: true, sameSite: 'lax' });
+    return res.json({ authenticated: false });
+  }
+
+  return res.json({ authenticated: true, username: session.username });
+});
+
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+
+  if (username !== APP_CREDENTIALS.username || password !== APP_CREDENTIALS.password) {
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+
+  const token = createSessionToken();
+  authSessions.set(token, {
+    username,
+    expiresAt: Date.now() + AUTH_SESSION_TTL_MS,
+  });
+
+  res.cookie(AUTH_COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: false,
+    maxAge: AUTH_SESSION_TTL_MS,
+  });
+
+  return res.json({ success: true, username });
+});
+
+app.post('/api/logout', (req, res) => {
+  const token = parseCookies(req.headers.cookie)[AUTH_COOKIE_NAME];
+  if (token) {
+    authSessions.delete(token);
+  }
+
+  res.clearCookie(AUTH_COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: 'lax',
+  });
+
+  return res.json({ success: true });
+});
+
+app.use((req, res, next) => {
+  if (req.path === '/api/login' || req.path === '/api/logout' || req.path === '/api/session' || req.path === '/api/health') {
+    return next();
+  }
+
+  if (req.path.startsWith('/api')) {
+    return requireAuth(req, res, next);
+  }
+
+  return next();
 });
 
 // Proxy URL fetcher to bypass CORS and resolve assets
